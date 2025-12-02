@@ -1,4 +1,5 @@
 hostname,deviceType
 172.16.255.252,cisco_ios
+172.16.255.249,cisco_ios
 
 
