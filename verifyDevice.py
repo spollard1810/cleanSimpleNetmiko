@@ -49,7 +49,7 @@ def verify_device(hostname, username, password):
         time.sleep(2)
         output = connection.read_channel()
         
-        if len(output) < 50:
+        if not output or len(output) < 50:
             raise Exception("No valid output received")
         
         result['deviceType'] = detect_device_type(output)
@@ -61,7 +61,10 @@ def verify_device(hostname, username, password):
         print(f"  ✗ {e}")
     finally:
         if connection:
-            connection.disconnect()
+            try:
+                connection.disconnect()
+            except:
+                pass
     
     return result
 
@@ -74,10 +77,17 @@ def main():
     hostnames = []
     
     if input_file.endswith('.csv'):
-        with open(input_file, 'r') as f:
-            reader = csv.DictReader(f)
-            hostnames = [row.get('hostname', list(row.values())[0]) for row in reader]
-        print(f"Loaded {len(hostnames)} hosts")
+        try:
+            with open(input_file, 'r') as f:
+                reader = csv.DictReader(f)
+                hostnames = [row.get('hostname', list(row.values())[0]) for row in reader]
+            print(f"Loaded {len(hostnames)} hosts")
+        except FileNotFoundError:
+            print(f"Error: File '{input_file}' not found.")
+            return
+        except Exception as e:
+            print(f"Error reading CSV: {e}")
+            return
     else:
         print("Enter hostnames (blank to finish):")
         while (host := input("  ").strip()):
