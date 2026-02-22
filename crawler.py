@@ -76,7 +76,11 @@ def load_csv_devices(filename, username, password, session_log):
 def detect_device_type_from_platform(platform):
     """Infer Netmiko device_type using CDP platform text."""
     blob = f" {platform or ''} ".lower()
-    for marker, device_type in PLATFORM_DEVICE_DETECTION_MAP.items():
+    for marker, device_type in sorted(
+        PLATFORM_DEVICE_DETECTION_MAP.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
         if marker in blob:
             return device_type
     # Default to cisco_ios (includes IOS/IOS-XE families).
