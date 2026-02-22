@@ -50,6 +50,21 @@ NXOS_CDP_NEIGHBOR_KEYS = {
     "capabilities": ["capabilities", "capability"],
 }
 
+CSV_REPORT_TEMPLATES = {
+    "crawled": {
+        "suffix": ".csv",
+        "fieldnames": ["hostname", "device_type", "mgmt_ip", "status", "error", "neighbor_count"],
+    },
+    "seen": {
+        "suffix": "_seen.csv",
+        "fieldnames": ["hostname", "device_type", "mgmt_ip", "platform", "capabilities", "discovered", "seen_via"],
+    },
+    "discovered": {
+        "suffix": "_discovered.csv",
+        "fieldnames": ["hostname", "device_type", "mgmt_ip", "platform", "capabilities", "discovered_from"],
+    },
+}
+
 
 def load_csv_devices(filename, username, password, session_log):
     """Load seed devices from CSV with hostname and deviceType/device_type columns."""
@@ -149,6 +164,74 @@ def neighbor_to_device_data(neighbor, source_device_type):
 def device_identity(hostname, device_type):
     """Stable device identity key."""
     return f"{(hostname or '').strip().lower()}|{(device_type or '').strip().lower()}"
+
+
+def normalize_report_path(base_name, suffix):
+    """Build report file path from base name + configured suffix."""
+    return f"{base_name}{suffix}"
+
+
+def write_csv_file(csv_path, fieldnames, rows):
+    """Write rows to CSV with a shared writer implementation."""
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_crawled_rows(crawled_results, seen_index):
+    """Build rows for crawled devices report."""
+    rows = []
+    for item in crawled_results:
+        key = device_identity(item.get("hostname"), item.get("device_type"))
+        seen_item = seen_index.get(key, {})
+        mgmt_ip = seen_item.get("mgmt_ip") or (item.get("hostname") if is_ipv4(item.get("hostname")) else "")
+        rows.append(
+            {
+                "hostname": item.get("hostname"),
+                "device_type": item.get("device_type"),
+                "mgmt_ip": mgmt_ip,
+                "status": "OK" if not item.get("error") else "ERROR",
+                "error": item.get("error"),
+                "neighbor_count": len(item.get("cdp_neighbors") or []),
+            }
+        )
+    return rows
+
+
+def build_seen_rows(seen_results):
+    """Build rows for seen devices report."""
+    rows = []
+    for item in seen_results:
+        rows.append(
+            {
+                "hostname": item.get("hostname"),
+                "device_type": item.get("device_type"),
+                "mgmt_ip": item.get("mgmt_ip"),
+                "platform": item.get("platform"),
+                "capabilities": item.get("capabilities"),
+                "discovered": item.get("discovered"),
+                "seen_via": ",".join(item.get("seen_via") or []),
+            }
+        )
+    return rows
+
+
+def build_discovered_rows(discovered_results):
+    """Build rows for discovered devices report."""
+    rows = []
+    for item in discovered_results:
+        rows.append(
+            {
+                "hostname": item.get("hostname"),
+                "device_type": item.get("device_type"),
+                "mgmt_ip": item.get("mgmt_ip"),
+                "platform": item.get("platform"),
+                "capabilities": item.get("capabilities"),
+                "discovered_from": item.get("discovered_from"),
+            }
+        )
+    return rows
 
 
 def track_seen_device(
@@ -390,61 +473,29 @@ def save_results(report, output_base):
         for item in seen_results
     }
 
-    json_path = f"{output_base}.json"
-    crawled_csv_path = f"{output_base}.csv"
-    seen_csv_path = f"{output_base}_seen.csv"
-    discovered_csv_path = f"{output_base}_discovered.csv"
+    json_path = normalize_report_path(output_base, ".json")
+    crawled_csv_path = normalize_report_path(output_base, CSV_REPORT_TEMPLATES["crawled"]["suffix"])
+    seen_csv_path = normalize_report_path(output_base, CSV_REPORT_TEMPLATES["seen"]["suffix"])
+    discovered_csv_path = normalize_report_path(output_base, CSV_REPORT_TEMPLATES["discovered"]["suffix"])
 
     with open(json_path, "w") as f:
         json.dump(report, f, indent=2)
 
-    with open(crawled_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["hostname", "device_type", "mgmt_ip", "status", "error", "neighbor_count"],
-        )
-        writer.writeheader()
-        for item in crawled_results:
-            key = device_identity(item.get("hostname"), item.get("device_type"))
-            seen_item = seen_index.get(key, {})
-            mgmt_ip = seen_item.get("mgmt_ip") or (item.get("hostname") if is_ipv4(item.get("hostname")) else "")
-            writer.writerow(
-                {
-                    "hostname": item.get("hostname"),
-                    "device_type": item.get("device_type"),
-                    "mgmt_ip": mgmt_ip,
-                    "status": "OK" if not item.get("error") else "ERROR",
-                    "error": item.get("error"),
-                    "neighbor_count": len(item.get("cdp_neighbors") or []),
-                }
-            )
-
-    with open(seen_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["hostname", "device_type", "mgmt_ip", "platform", "capabilities", "discovered", "seen_via"],
-        )
-        writer.writeheader()
-        for item in seen_results:
-            writer.writerow(
-                {
-                    "hostname": item.get("hostname"),
-                    "device_type": item.get("device_type"),
-                    "mgmt_ip": item.get("mgmt_ip"),
-                    "platform": item.get("platform"),
-                    "capabilities": item.get("capabilities"),
-                    "discovered": item.get("discovered"),
-                    "seen_via": ",".join(item.get("seen_via") or []),
-                }
-            )
-
-    with open(discovered_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["hostname", "device_type", "mgmt_ip", "platform", "capabilities", "discovered_from"],
-        )
-        writer.writeheader()
-        writer.writerows(discovered_results)
+    write_csv_file(
+        crawled_csv_path,
+        CSV_REPORT_TEMPLATES["crawled"]["fieldnames"],
+        build_crawled_rows(crawled_results, seen_index),
+    )
+    write_csv_file(
+        seen_csv_path,
+        CSV_REPORT_TEMPLATES["seen"]["fieldnames"],
+        build_seen_rows(seen_results),
+    )
+    write_csv_file(
+        discovered_csv_path,
+        CSV_REPORT_TEMPLATES["discovered"]["fieldnames"],
+        build_discovered_rows(discovered_results),
+    )
 
     print(
         "Saved results: "
