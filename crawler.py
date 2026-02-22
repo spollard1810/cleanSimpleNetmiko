@@ -2,24 +2,52 @@ from Core import NetworkDevice
 import argparse
 import csv
 import getpass
+import ipaddress
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-CDP_DETAIL_COMMAND = "show cdp n det"
+CDP_DETAIL_COMMAND = "show cdp neighbors detail"
 
-# Simple CDP-based device type detection map (substring -> Netmiko device_type).
-DEVICE_TYPE_DETECTION_MAP = {
+# Platform-driven device detection map (substring -> Netmiko device_type).
+# IOS and IOS-XE are intentionally collapsed into cisco_ios.
+PLATFORM_DEVICE_DETECTION_MAP = {
+    "ios xe": "cisco_ios",
+    "ios-xe": "cisco_ios",
+    "iosxe": "cisco_ios",
+    "cisco ios": "cisco_ios",
+    "ios": "cisco_ios",
+    "catalyst": "cisco_ios",
+    "ws-c": "cisco_ios",
+    "c9": "cisco_ios",
     "ios xr": "cisco_xr",
+    "asr9k": "cisco_xr",
     "nx-os": "cisco_nxos",
     "nexus": "cisco_nxos",
+    "n9k": "cisco_nxos",
+    "n7k": "cisco_nxos",
+    "n5k": "cisco_nxos",
+    "n3k": "cisco_nxos",
     "adaptive security appliance": "cisco_asa",
-    " asa ": "cisco_asa",
+    "asa": "cisco_asa",
     "wireless lan controller": "cisco_wlc",
     "wireless": "cisco_wlc",
+    "air-ct": "cisco_wlc",
     "wlc": "cisco_wlc",
-    "catalyst": "cisco_ios",
-    "ios": "cisco_ios",
+}
+
+IOS_CDP_NEIGHBOR_KEYS = {
+    "neighbor_name": ["neighbor_name", "device_id", "destination_host", "neighbor"],
+    "mgmt_ip": ["mgmt_address", "management_ip", "mgmt_ip", "ip_address", "entry_address"],
+    "platform": ["platform"],
+    "capabilities": ["capabilities", "capability"],
+}
+
+NXOS_CDP_NEIGHBOR_KEYS = {
+    "neighbor_name": ["neighbor_name", "system_name", "chassis_id", "device_id"],
+    "mgmt_ip": ["mgmt_address", "interface_ip", "management_ip", "mgmt_ip"],
+    "platform": ["platform"],
+    "capabilities": ["capabilities", "capability"],
 }
 
 
@@ -45,19 +73,24 @@ def load_csv_devices(filename, username, password, session_log):
     return devices
 
 
-def detect_device_type(platform, capabilities, device_id):
-    """Infer Netmiko device_type from CDP neighbor attributes."""
-    blob = f" {platform or ''} {capabilities or ''} {device_id or ''} ".lower()
-    for marker, device_type in DEVICE_TYPE_DETECTION_MAP.items():
+def detect_device_type_from_platform(platform):
+    """Infer Netmiko device_type using CDP platform text."""
+    blob = f" {platform or ''} ".lower()
+    for marker, device_type in PLATFORM_DEVICE_DETECTION_MAP.items():
         if marker in blob:
             return device_type
+    # Default to cisco_ios (includes IOS/IOS-XE families).
     return "cisco_ios"
 
 
 def normalize_cdp_neighbors(parsed):
     """Normalize NTC-Templates CDP parsed output to list[dict]."""
     if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, dict)]
+        normalized = []
+        for item in parsed:
+            if isinstance(item, dict):
+                normalized.append({str(key).strip().lower(): value for key, value in item.items()})
+        return normalized
     return []
 
 
@@ -70,23 +103,42 @@ def neighbor_value(neighbor, keys):
     return ""
 
 
-def neighbor_to_device_data(neighbor):
+def is_ipv4(value):
+    """Return True if value is a valid IPv4 address."""
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except Exception:
+        return False
+
+
+def pick_template_key_map(source_device_type):
+    """
+    CDP TextFSM fields differ by source OS template.
+    Distinguish IOS/IOS-XE style and NX-OS style parsing.
+    """
+    if (source_device_type or "").strip().lower() == "cisco_nxos":
+        return NXOS_CDP_NEIGHBOR_KEYS
+    return IOS_CDP_NEIGHBOR_KEYS
+
+
+def neighbor_to_device_data(neighbor, source_device_type):
     """Extract canonical fields from one CDP neighbor record."""
-    mgmt_ip = neighbor_value(neighbor, ["management_ip", "mgmt_ip", "ip_address", "entry_address"])
-    device_id = neighbor_value(neighbor, ["device_id", "destination_host", "neighbor"])
-    platform = neighbor_value(neighbor, ["platform"])
-    capabilities = neighbor_value(neighbor, ["capabilities", "capability"])
-    hostname = mgmt_ip or device_id
+    key_map = pick_template_key_map(source_device_type)
+    neighbor_name = neighbor_value(neighbor, key_map["neighbor_name"])
+    mgmt_ip = neighbor_value(neighbor, key_map["mgmt_ip"])
+    platform = neighbor_value(neighbor, key_map["platform"])
+    capabilities = neighbor_value(neighbor, key_map["capabilities"])
+    hostname = mgmt_ip or neighbor_name
     if not hostname:
         return None
 
     return {
         "hostname": hostname,
         "mgmt_ip": mgmt_ip,
-        "device_id": device_id,
+        "neighbor_name": neighbor_name,
         "platform": platform,
         "capabilities": capabilities,
-        "device_type": detect_device_type(platform, capabilities, device_id),
+        "device_type": detect_device_type_from_platform(platform),
     }
 
 
@@ -99,6 +151,7 @@ def track_seen_device(
     seen_devices,
     hostname,
     device_type,
+    mgmt_ip="",
     platform="",
     capabilities="",
     seen_via="",
@@ -110,6 +163,7 @@ def track_seen_device(
         seen_devices[key] = {
             "hostname": hostname,
             "device_type": device_type,
+            "mgmt_ip": mgmt_ip,
             "platform": platform,
             "capabilities": capabilities,
             "discovered": discovered,
@@ -117,6 +171,8 @@ def track_seen_device(
         }
 
     current = seen_devices[key]
+    if mgmt_ip and not current["mgmt_ip"]:
+        current["mgmt_ip"] = mgmt_ip
     if platform and not current["platform"]:
         current["platform"] = platform
     if capabilities and not current["capabilities"]:
@@ -128,9 +184,9 @@ def track_seen_device(
     return key
 
 
-def build_device_from_neighbor(neighbor, username, password, session_log):
+def build_device_from_neighbor(neighbor, source_device_type, username, password, session_log):
     """Create a NetworkDevice from one CDP neighbor record."""
-    data = neighbor_to_device_data(neighbor)
+    data = neighbor_to_device_data(neighbor, source_device_type=source_device_type)
     if not data:
         return None, None
 
@@ -196,6 +252,7 @@ def crawl_recursive(
             seen_devices,
             hostname=device.hostname,
             device_type=device.device_type,
+            mgmt_ip=device.hostname if is_ipv4(device.hostname) else "",
             seen_via="seed" if depth == 0 else "",
             discovered=(depth != 0),
         )
@@ -222,11 +279,13 @@ def crawl_recursive(
 
     for result in results:
         source_hostname = result["hostname"]
+        source_device_type = result["device_type"]
         for neighbor in result.get("cdp_neighbors", []):
             next_device, device_data = build_device_from_neighbor(
                 neighbor,
-                username,
-                password,
+                source_device_type=source_device_type,
+                username=username,
+                password=password,
                 session_log=session_log,
             )
             if not next_device or not device_data:
@@ -237,6 +296,7 @@ def crawl_recursive(
                 seen_devices,
                 hostname=next_device.hostname,
                 device_type=next_device.device_type,
+                mgmt_ip=device_data["mgmt_ip"],
                 platform=device_data["platform"],
                 capabilities=device_data["capabilities"],
                 seen_via=source_hostname,
@@ -259,6 +319,7 @@ def crawl_recursive(
                 discovered_devices[device_key] = {
                     "hostname": next_device.hostname,
                     "device_type": next_device.device_type,
+                    "mgmt_ip": device_data["mgmt_ip"],
                     "platform": device_data["platform"],
                     "capabilities": device_data["capabilities"],
                     "discovered_from": source_hostname,
@@ -320,6 +381,10 @@ def save_results(report, output_base):
     crawled_results = report.get("crawled_devices", [])
     seen_results = report.get("seen_devices", [])
     discovered_results = report.get("discovered_devices", [])
+    seen_index = {
+        device_identity(item.get("hostname"), item.get("device_type")): item
+        for item in seen_results
+    }
 
     json_path = f"{output_base}.json"
     crawled_csv_path = f"{output_base}.csv"
@@ -332,14 +397,18 @@ def save_results(report, output_base):
     with open(crawled_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["hostname", "device_type", "status", "error", "neighbor_count"],
+            fieldnames=["hostname", "device_type", "mgmt_ip", "status", "error", "neighbor_count"],
         )
         writer.writeheader()
         for item in crawled_results:
+            key = device_identity(item.get("hostname"), item.get("device_type"))
+            seen_item = seen_index.get(key, {})
+            mgmt_ip = seen_item.get("mgmt_ip") or (item.get("hostname") if is_ipv4(item.get("hostname")) else "")
             writer.writerow(
                 {
                     "hostname": item.get("hostname"),
                     "device_type": item.get("device_type"),
+                    "mgmt_ip": mgmt_ip,
                     "status": "OK" if not item.get("error") else "ERROR",
                     "error": item.get("error"),
                     "neighbor_count": len(item.get("cdp_neighbors") or []),
@@ -349,7 +418,7 @@ def save_results(report, output_base):
     with open(seen_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["hostname", "device_type", "platform", "capabilities", "discovered", "seen_via"],
+            fieldnames=["hostname", "device_type", "mgmt_ip", "platform", "capabilities", "discovered", "seen_via"],
         )
         writer.writeheader()
         for item in seen_results:
@@ -357,6 +426,7 @@ def save_results(report, output_base):
                 {
                     "hostname": item.get("hostname"),
                     "device_type": item.get("device_type"),
+                    "mgmt_ip": item.get("mgmt_ip"),
                     "platform": item.get("platform"),
                     "capabilities": item.get("capabilities"),
                     "discovered": item.get("discovered"),
@@ -367,7 +437,7 @@ def save_results(report, output_base):
     with open(discovered_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["hostname", "device_type", "platform", "capabilities", "discovered_from"],
+            fieldnames=["hostname", "device_type", "mgmt_ip", "platform", "capabilities", "discovered_from"],
         )
         writer.writeheader()
         writer.writerows(discovered_results)
