@@ -49,3 +49,10 @@ _*.py
 *.backup
 
 .DS_Store
+
+# Beads issue tracking
+.beads/
+AGENTS.md
+
+# Conda environment
+.conda/
